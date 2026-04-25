@@ -249,6 +249,7 @@ class SimpleMoozicBuilderUI(ctk.CTk):
 
         self.default_poster_path = self.assets_root / "poster" / "poster.png"
         self.poster_path: Path | None = self.default_poster_path if self.default_poster_path.exists() else None
+        self.cover_image_dir: Path | None = None  # Auto-cover folder for vinyl/cover images
         self.final_output_dir: Path | None = None
         self.track_rows: list[dict] = []
         self.track_settings: dict[str, dict] = {}
@@ -279,6 +280,7 @@ class SimpleMoozicBuilderUI(ctk.CTk):
         self.author_var = tk.StringVar(value="")
         self.poster_add_name_var = tk.BooleanVar(value=True)
         self.poster_var = tk.StringVar(value="poster.png" if self.poster_path else "Select poster")
+        self.cover_image_dir_var = tk.StringVar(value="No auto-cover folder")
         self.audio_status_var = tk.StringVar(value=f"/{self.audio_dir_active.name}")
         self.filter_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Ready")
@@ -428,6 +430,20 @@ class SimpleMoozicBuilderUI(ctk.CTk):
         btn_default = ctk.CTkButton(controls_row, text="\u25a3", width=40, command=self.apply_default_to_all)
         btn_default.pack(side="left", padx=(0, 6))
         Tooltip(btn_default, "Apply Mod Default to All (Random Textures)")
+
+        btn_auto_cover = ctk.CTkButton(controls_row, text="\U0001F5BC", width=40, command=self.pick_cover_image_dir)
+        btn_auto_cover.pack(side="left", padx=(0, 2))
+        Tooltip(btn_auto_cover, "Select Auto-Cover Image Folder\n(auto-assigns cover images by matching filename to song name)")
+        self.cover_image_dir_label = ctk.CTkLabel(
+            controls_row,
+            textvariable=self.cover_image_dir_var,
+            anchor="w",
+            width=140,
+            text_color=("#8a9ab5", "#8a9ab5"),
+        )
+        self.cover_image_dir_label.pack(side="left", padx=(0, 16))
+        Tooltip(self.cover_image_dir_label, "Auto-cover folder — right-click to clear")
+        self.cover_image_dir_label.bind("<Button-3>", self._on_cover_image_dir_label_right_click)
 
         cassette_switch_wrap = ctk.CTkFrame(controls_row, fg_color="transparent")
         cassette_switch_wrap.pack(side="left", padx=(20, 8))
@@ -678,6 +694,7 @@ class SimpleMoozicBuilderUI(ctk.CTk):
             "output_dir": str(self.out_dir),
             "workshop_dir": str(self.workshop_dir_override) if self.workshop_dir_override else None,
             "global_vinyl_mask": (self.global_vinyl_mask_var.get() or "inside").strip().lower(),
+            "cover_image_dir": str(self.cover_image_dir) if self.cover_image_dir else None,
             "track_settings": self.track_settings,
             "song_order": [row["ogg"].name for row in self.track_rows],
             "excluded_oggs": sorted(self.excluded_oggs),
@@ -723,6 +740,16 @@ class SimpleMoozicBuilderUI(ctk.CTk):
             wp = Path(workshop_raw)
             if wp.exists():
                 self.workshop_dir_override = wp
+
+        cover_image_dir_raw = data.get("cover_image_dir")
+        if cover_image_dir_raw:
+            cd = Path(cover_image_dir_raw)
+            if cd.exists() and cd.is_dir():
+                self.cover_image_dir = cd
+                self.cover_image_dir_var.set(f"/{cd.name}")
+            else:
+                self.cover_image_dir = None
+                self.cover_image_dir_var.set("No auto-cover folder")
 
         mask = (data.get("global_vinyl_mask") or "inside").strip().lower()
         self.apply_global_vinyl_mask(mask)
@@ -1069,10 +1096,14 @@ class SimpleMoozicBuilderUI(ctk.CTk):
         if not selected:
             return
         converted = 0
+        skipped_ogg = 0
         errors = 0
         for key in selected:
             row = next((r for r in self.track_rows if r["ogg"].name == key), None)
             if not row:
+                continue
+            if row["source"].suffix.lower() == ".ogg":
+                skipped_ogg += 1
                 continue
             try:
                 entry = convert_single_audio_file(row["source"], self.audio_dir_active, force=True)
@@ -1085,10 +1116,14 @@ class SimpleMoozicBuilderUI(ctk.CTk):
         for key in selected:
             if key in self.tree.get_children():
                 self.tree.selection_add(key)
+        parts = []
+        if converted:
+            parts.append(f"Converted {converted} song(s)")
+        if skipped_ogg:
+            parts.append(f"skipped {skipped_ogg} already-.ogg")
         if errors:
-            self.status_var.set(f"Converted {converted} song(s), {errors} failed")
-        else:
-            self.status_var.set(f"Converted {converted} song(s)")
+            parts.append(f"{errors} failed")
+        self.status_var.set(", ".join(parts) if parts else "Nothing to convert")
 
     def remove_selected_songs(self) -> None:
         selected = self._selected_keys()
@@ -1725,6 +1760,8 @@ class SimpleMoozicBuilderUI(ctk.CTk):
                     cfg["b_side"] = None
 
         self._redraw_tree()
+        if self.cover_image_dir:
+            self._apply_auto_covers()
         self.status_var.set(f"Loaded {len(self.track_rows)} songs")
 
     def _fuzzy_match(self, text: str, query: str) -> bool:
@@ -2287,6 +2324,86 @@ class SimpleMoozicBuilderUI(ctk.CTk):
         self.bulk_cassette_var.set(all(bool(cfg.get("cassette", False)) for cfg in self.track_settings.values()))
         self.bulk_vinyl_var.set(all(bool(cfg.get("vinyl", False)) for cfg in self.track_settings.values()))
 
+    # Auto-find song cover
+
+    _COVER_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+
+    def pick_cover_image_dir(self) -> None:
+        # Let the user choose a folder that holds cover images named after songs.
+        initial = (
+            self.cover_image_dir
+            if self.cover_image_dir and self.cover_image_dir.exists()
+            else self.last_image_pick_dir
+        )
+        selected = filedialog.askdirectory(
+            title="Select Auto-Cover Image Folder",
+            initialdir=str(initial),
+            parent=self,
+        )
+        if not selected:
+            return
+        self.cover_image_dir = Path(selected)
+        self.cover_image_dir_var.set(f"/{self.cover_image_dir.name}")
+        count = self._apply_auto_covers()
+        self.status_var.set(
+            f"Auto-cover: assigned {count} cover image(s) from /{self.cover_image_dir.name}"
+        )
+
+    def _on_cover_image_dir_label_right_click(self, _event=None) -> str:
+        # Right-click on the cover-dir label to clear the auto-cover folder.
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Clear Auto-Cover Folder", command=self.clear_cover_image_dir)
+        try:
+            menu.tk_popup(_event.x_root, _event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def clear_cover_image_dir(self) -> None:
+        self.cover_image_dir = None
+        self.cover_image_dir_var.set("No auto-cover folder")
+        self.status_var.set("Auto-cover folder cleared")
+
+    def _build_cover_image_index(self) -> dict[str, Path]:
+        # Return a dict mapping lowercase stem -> image Path for the cover image folder.
+        if self.cover_image_dir is None or not self.cover_image_dir.is_dir():
+            return {}
+        index: dict[str, Path] = {}
+        for p in self.cover_image_dir.iterdir():
+            if p.is_file() and p.suffix.lower() in self._COVER_IMAGE_EXTS:
+                index[p.stem.lower()] = p
+        return index
+
+    def _apply_auto_covers(self, *, overwrite: bool = False) -> int:
+        # Match songs to cover images by stem name and assign them.
+        index = self._build_cover_image_index()
+        if not index:
+            return 0
+        assigned = 0
+        for row in self.track_rows:
+            key = row["ogg"].name
+            cfg = self.track_settings.setdefault(key, {})
+            if not overwrite and cfg.get("cover"):
+                continue
+            cfg_display = cfg.get("display_name") or ""
+            stems_to_try = []
+            if cfg_display:
+                stems_to_try.append(Path(cfg_display).stem.lower())
+            stems_to_try.append(row["source"].stem.lower())
+            if row["ogg"] != row["source"]:
+                stems_to_try.append(row["ogg"].stem.lower())
+            matched: Path | None = None
+            for stem in stems_to_try:
+                if stem in index:
+                    matched = index[stem]
+                    break
+            if matched is not None:
+                cfg["cover"] = str(matched)
+                assigned += 1
+        if assigned:
+            self._redraw_tree()
+        return assigned
+
     def apply_poster_to_all(self) -> None:
         if self.poster_path is None:
             self.status_var.set("Select workshop poster first to apply poster override")
@@ -2319,19 +2436,25 @@ class SimpleMoozicBuilderUI(ctk.CTk):
         processed = 0
         seen_sources: set[str] = set()
 
+        source_to_rows: dict[str, list[dict]] = {}
+        for row in self.track_rows:
+            try:
+                rkey = str(row["source"].resolve())
+                source_to_rows.setdefault(rkey, []).append(row)
+            except Exception:
+                pass
+
         def _on_progress(entry) -> None:
             nonlocal processed
             processed += 1
             src_resolved = str(entry.source.resolve()) if entry and entry.source else ""
-            for row in self.track_rows:
-                try:
-                    if str(row["source"].resolve()) == src_resolved:
-                        row["ogg"] = entry.ogg
-                        row["status"] = entry.status
-                        row["detail"] = entry.detail
-                except Exception:
-                    pass
-            self._redraw_tree()
+            for row in source_to_rows.get(src_resolved, []):
+                row["ogg"] = entry.ogg
+                row["status"] = entry.status
+                row["detail"] = entry.detail
+                ogg_key = entry.ogg.name
+                if self.tree.exists(ogg_key):
+                    self.tree.set(ogg_key, "status", entry.status)
             self.build_progress_var.set(max(0.0, min(1.0, processed / total_sources)))
             self.status_var.set(f"Converting songs... ({processed}/{total_sources})")
             self.update_idletasks()
@@ -2343,7 +2466,10 @@ class SimpleMoozicBuilderUI(ctk.CTk):
                 if src_key in seen_sources:
                     continue
                 seen_sources.add(src_key)
-                entry = convert_single_audio_file(src, self.audio_dir_active, force=False)
+                if src.suffix.lower() == ".ogg":
+                    entry = AudioTrackEntry(source=src, ogg=src, status="ready", detail="source ogg")
+                else:
+                    entry = convert_single_audio_file(src, self.audio_dir_active, force=False)
                 _on_progress(entry)
         except SystemExit as e:
             messagebox.showerror("Audio Conversion Error", str(e))
@@ -2589,6 +2715,8 @@ class SimpleMoozicBuilderUI(ctk.CTk):
         self.last_image_pick_dir = self.cover_root if self.cover_root.exists() else Path.home()
         self.audio_status_var.set(f"/{self.audio_dir_active.name}")
         self._refresh_audio_source_button_text()
+        self.cover_image_dir = None
+        self.cover_image_dir_var.set("No auto-cover folder")
         self.track_settings.clear()
         self.excluded_oggs.clear()
         self.filter_var.set("")
@@ -2716,6 +2844,3 @@ if __name__ == "__main__":
 
     app = SimpleMoozicBuilderUI()
     app.mainloop()
-
-
-
